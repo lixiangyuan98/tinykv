@@ -161,12 +161,7 @@ func (l *RaftLog) appendEntries(prevLogIndex uint64, entries []*pb.Entry) {
 				break
 			}
 		}
-		// all entries have been appended
-		if i == len(entries) {
-			entries = entries[:0]
-		} else {
-			entries = entries[i:]
-		}
+		entries = entries[i:]
 	}
 	for _, entry := range entries {
 		l.entries = append(l.entries, *entry)
