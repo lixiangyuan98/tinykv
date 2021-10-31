@@ -70,12 +70,20 @@ type Ready struct {
 type RawNode struct {
 	Raft *Raft
 	// Your Data Here (2A).
+	SoftState
+	pb.HardState
 }
 
 // NewRawNode returns a new RawNode given configuration and a list of raft peers.
 func NewRawNode(config *Config) (*RawNode, error) {
 	// Your Code Here (2A).
-	return nil, nil
+	rn := new(RawNode)
+	rn.Raft = newRaft(config)
+	// set init HardState from Config
+	rn.Term = rn.Raft.Term
+	rn.Vote = rn.Raft.Vote
+	rn.Commit = rn.Raft.RaftLog.committed
+	return rn, nil
 }
 
 // Tick advances the internal logical clock by a single tick.
@@ -143,12 +151,42 @@ func (rn *RawNode) Step(m pb.Message) error {
 // Ready returns the current point-in-time state of this RawNode.
 func (rn *RawNode) Ready() Ready {
 	// Your Code Here (2A).
-	return Ready{}
+	rd := Ready{}
+	if rn.Lead != rn.Raft.Lead || rn.RaftState != rn.Raft.State {
+		rd.SoftState = new(SoftState)
+		rd.SoftState.Lead = rn.Raft.Lead
+		rd.SoftState.RaftState = rn.Raft.State
+	}
+	if rn.Term != rn.Raft.Term || rn.Commit != rn.Raft.RaftLog.committed || rn.Vote != rn.Raft.Vote {
+		rd.HardState = pb.HardState{}
+		rd.HardState.Term = rn.Raft.Term
+		rd.HardState.Vote = rn.Raft.Vote
+		rd.HardState.Commit = rn.Raft.RaftLog.committed
+	}
+	rd.Entries = rn.Raft.RaftLog.unstableEntries()
+	rd.CommittedEntries = rn.Raft.RaftLog.nextEnts()
+	rd.Messages = rn.Raft.msgs
+	return rd
 }
 
 // HasReady called when RawNode user need to check if any Ready pending.
 func (rn *RawNode) HasReady() bool {
 	// Your Code Here (2A).
+	if rn.Lead != rn.Raft.Lead || rn.RaftState != rn.Raft.State {
+		return true
+	}
+	if rn.Term != rn.Raft.Term || rn.Commit != rn.Raft.RaftLog.committed || rn.Vote != rn.Raft.Vote {
+		return true
+	}
+	if rn.Raft.RaftLog.stabled != rn.Raft.RaftLog.LastIndex() {
+		return true
+	}
+	if rn.Raft.RaftLog.committed != rn.Raft.RaftLog.applied {
+		return true
+	}
+	if len(rn.Raft.msgs) > 0 {
+		return true
+	}
 	return false
 }
 
@@ -156,6 +194,15 @@ func (rn *RawNode) HasReady() bool {
 // last Ready results.
 func (rn *RawNode) Advance(rd Ready) {
 	// Your Code Here (2A).
+	if rd.SoftState != nil {
+		rn.SoftState = *rd.SoftState
+	}
+	if rd.HardState.Term > rn.Term || rd.HardState.Vote != rn.Vote || rd.HardState.Commit > rn.Commit {
+		rn.HardState = rd.HardState
+	}
+	rn.Raft.RaftLog.stabled += uint64(len(rd.Entries))
+	rn.Raft.RaftLog.applied += uint64(len(rd.CommittedEntries))
+	rn.Raft.msgs = rn.Raft.msgs[len(rd.Messages):]
 }
 
 // GetProgress return the the Progress of this node and its peers, if this
