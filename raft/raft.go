@@ -19,6 +19,7 @@ import (
 	"math/rand"
 	"sort"
 
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -167,7 +168,7 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
-	hardState, _, err := c.Storage.InitialState()
+	hardState, confState, err := c.Storage.InitialState()
 	if err != nil {
 		panic("init RaftLog error")
 	}
@@ -179,6 +180,9 @@ func newRaft(c *Config) *Raft {
 	r.heartbeatTimeout = c.HeartbeatTick
 	r.Prs = make(map[uint64]*Progress)
 	for _, peer := range c.peers {
+		r.Prs[peer] = new(Progress)
+	}
+	for _, peer := range confState.Nodes {
 		r.Prs[peer] = new(Progress)
 	}
 	r.RaftLog = newLog(c.Storage)
@@ -206,8 +210,7 @@ func (r *Raft) sendRequestVote(to uint64) bool {
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
 	var entries []*pb.Entry
-	lastIndex := r.RaftLog.LastIndex()
-	ents, _ := r.RaftLog.Entries(r.Prs[to].Next, lastIndex+1)
+	ents := r.RaftLog.entries[r.Prs[to].Next-r.RaftLog.first:]
 	for _, entry := range ents {
 		e := entry
 		entries = append(entries, &e)
@@ -233,11 +236,15 @@ func (r *Raft) sendAppend(to uint64) bool {
 // sendHeartbeat sends a heartbeat RPC to the given peer.
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
+	prevLogIndex := r.Prs[to].Next - 1
+	prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
 	msg := pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeat,
 		To:      to,
 		From:    r.id,
 		Term:    r.Term,
+		Index:   prevLogIndex,
+		LogTerm: prevLogTerm,
 		Commit:  r.RaftLog.committed,
 	}
 	r.msgs = append(r.msgs, msg)
@@ -254,6 +261,8 @@ func (r *Raft) tick() {
 			r.heartbeatElapsed = 0
 			_ = r.Step(pb.Message{
 				MsgType: pb.MessageType_MsgBeat,
+				From:    r.id,
+				To:      r.id,
 			})
 		}
 	default:
@@ -261,6 +270,8 @@ func (r *Raft) tick() {
 			r.electionElapsed = 0
 			_ = r.Step(pb.Message{
 				MsgType: pb.MessageType_MsgHup,
+				From:    r.id,
+				To:      r.id,
 			})
 		}
 	}
@@ -382,8 +393,15 @@ func (r *Raft) Step(m pb.Message) error {
 		case pb.MessageType_MsgHeartbeat:
 			r.handleHeartbeat(m)
 		case pb.MessageType_MsgHeartbeatResponse:
-			if m.Index < r.RaftLog.LastIndex() {
+			if m.Reject {
+				r.Prs[m.From].Next = m.Index
 				r.sendAppend(m.From)
+			} else {
+				r.Prs[m.From].Match = m.Index
+				r.Prs[m.From].Next = m.Index + 1
+				if m.Index < r.RaftLog.LastIndex() {
+					r.sendAppend(m.From)
+				}
 			}
 		case pb.MessageType_MsgBeat:
 			for peer := range r.Prs {
@@ -402,7 +420,7 @@ func (r *Raft) Step(m pb.Message) error {
 			r.Prs[r.id].Next = index
 			r.Prs[r.id].Match = index - 1
 			if len(r.Prs) == 1 {
-				r.RaftLog.committed += uint64(len(m.Entries))
+				r.RaftLog.committed = index - 1
 			} else {
 				for id := range r.Prs {
 					if id != r.id {
@@ -414,7 +432,7 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleAppendEntries(m)
 		case pb.MessageType_MsgAppendResponse:
 			if m.Reject {
-				r.Prs[m.From].Next--
+				r.Prs[m.From].Next = m.Index
 				r.sendAppend(m.From)
 			} else {
 				r.Prs[m.From].Match = m.Index
@@ -433,8 +451,8 @@ func (r *Raft) Step(m pb.Message) error {
 						// tell the followers to commit
 						_ = r.Step(pb.Message{
 							MsgType: pb.MessageType_MsgPropose,
-							To:      r.id,
 							From:    r.id,
+							To:      r.id,
 						})
 						break
 					}
@@ -484,12 +502,29 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		r.becomeFollower(m.Term, m.From)
 		term, err := r.RaftLog.Term(m.Index)
 		// log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
-		if err != nil || term != m.LogTerm {
+		if err != nil {
+			if err == ErrUnavailable {
+				msg.Index = r.RaftLog.LastIndex() + 1
+			} else {
+				// TODO
+				log.Panicf("too small")
+				msg.Index = m.Index - 1
+			}
+			msg.Reject = true
+		} else if term != m.LogTerm {
+			i := m.Index
+			for ; i > r.RaftLog.first; i-- {
+				if r.RaftLog.entries[i-r.RaftLog.first].Term != term {
+					break
+				}
+			}
+			msg.Index = i
 			msg.Reject = true
 		} else {
 			r.RaftLog.appendEntries(m.Index, m.Entries)
 			lastNewEntryIndex := m.Index + uint64(len(m.Entries))
-			if m.Commit > r.RaftLog.committed {
+			msg.Index = lastNewEntryIndex
+			if m.Commit > r.RaftLog.committed && lastNewEntryIndex > r.RaftLog.committed {
 				if m.Commit > lastNewEntryIndex {
 					r.RaftLog.committed = lastNewEntryIndex
 				} else {
@@ -498,7 +533,6 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			}
 		}
 	}
-	msg.Index = r.RaftLog.LastIndex()
 	msg.Term = r.Term
 	r.msgs = append(r.msgs, msg)
 }
@@ -515,17 +549,41 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 		msg.Reject = true
 	} else {
 		r.becomeFollower(m.Term, m.From)
-		// r.RaftLog.appendEntries(m.Index, m.Entries)
-		lastNewEntryIndex := m.Index + uint64(len(m.Entries))
-		if m.Commit > r.RaftLog.committed {
-			if m.Commit > lastNewEntryIndex {
-				r.RaftLog.committed = lastNewEntryIndex
+		term, err := r.RaftLog.Term(m.Index)
+		// log doesn't contain an entry at prevLogIndex whose term matches prevLogTerm
+		if err != nil {
+			if err == ErrUnavailable {
+				msg.Index = r.RaftLog.LastIndex() + 1
 			} else {
-				r.RaftLog.committed = m.Commit
+				// TODO
+				log.Panicf("too small")
+				msg.Index = m.Index - 1
+			}
+			msg.Reject = true
+		} else if term != m.LogTerm {
+			i := m.Index
+			for ; i > r.RaftLog.first; i-- {
+				if r.RaftLog.entries[i-r.RaftLog.first].Term != term {
+					break
+				}
+			}
+			msg.Index = i
+			msg.Reject = true
+		} else {
+			lastNewEntryIndex := m.Index
+			msg.Index = lastNewEntryIndex
+			if lastNewEntryIndex > r.RaftLog.LastIndex() {
+				lastNewEntryIndex = r.RaftLog.LastIndex()
+			}
+			if m.Commit > r.RaftLog.committed && lastNewEntryIndex > r.RaftLog.committed {
+				if m.Commit > lastNewEntryIndex {
+					r.RaftLog.committed = lastNewEntryIndex
+				} else {
+					r.RaftLog.committed = m.Commit
+				}
 			}
 		}
 	}
-	msg.Index = r.RaftLog.LastIndex()
 	msg.Term = r.Term
 	r.msgs = append(r.msgs, msg)
 }

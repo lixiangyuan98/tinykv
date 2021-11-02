@@ -200,8 +200,12 @@ func (rn *RawNode) Advance(rd Ready) {
 	if rd.HardState.Term > rn.Term || rd.HardState.Vote != rn.Vote || rd.HardState.Commit > rn.Commit {
 		rn.HardState = rd.HardState
 	}
-	rn.Raft.RaftLog.stabled += uint64(len(rd.Entries))
-	rn.Raft.RaftLog.applied += uint64(len(rd.CommittedEntries))
+	if len(rd.Entries) > 0 {
+		rn.Raft.RaftLog.stabled = rd.Entries[len(rd.Entries)-1].Index
+	}
+	if len(rd.CommittedEntries) > 0 {
+		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+	}
 	rn.Raft.msgs = rn.Raft.msgs[len(rd.Messages):]
 }
 

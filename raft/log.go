@@ -55,6 +55,8 @@ type RaftLog struct {
 	// Your Data Here (2A).
 	// first is the first index in the entries
 	first uint64
+
+	lastTerm uint64
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -63,21 +65,25 @@ func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
 	var err error
 	l := new(RaftLog)
-	l.first = 1
 	firstIndex, err := storage.FirstIndex()
 	if err != nil {
-		panic("init RaftLog error")
+		log.Panicf("init RaftLog error: %v", err)
 	}
+	l.lastTerm, err = storage.Term(firstIndex - 1)
+	if err != nil {
+		log.Panicf("init RaftLog error: %v", err)
+	}
+	l.first = firstIndex
+	l.stabled = l.first - 1
 	lastIndex, err := storage.LastIndex()
 	if err != nil {
-		panic("init RaftLog error")
+		log.Panicf("init RaftLog error: %v", err)
 	}
 	if lastIndex >= firstIndex {
 		ents, err := storage.Entries(firstIndex, lastIndex+1)
 		if err != nil {
-			panic("init RaftLog error")
+			log.Panicf("init RaftLog error: %v", err)
 		}
-		l.first = firstIndex
 		l.entries = append(l.entries, ents...)
 		l.stabled = lastIndex
 	}
@@ -110,23 +116,13 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 	return l.entries[l.applied-l.first+1 : l.committed-l.first+1]
 }
 
-func (l *RaftLog) Entries(lo, hi uint64) ([]pb.Entry, error) {
-	if lo < l.first {
-		return nil, ErrCompacted
-	}
-	if hi > l.LastIndex()+1 {
-		return nil, ErrUnavailable
-	}
-	return l.entries[lo-l.first : hi-l.first], nil
-}
-
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
 	if len(l.entries) > 0 {
 		return l.entries[len(l.entries)-1].Index
 	}
-	return 0
+	return l.first - 1
 }
 
 // Term return the term of the entry in the given index
@@ -136,10 +132,10 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 		return 0, ErrCompacted
 	}
 	if i == l.first-1 {
-		return 0, nil
+		return l.lastTerm, nil
 	}
 	if i > l.LastIndex() {
-		return 0, ErrCompacted
+		return 0, ErrUnavailable
 	}
 	return l.entries[i-l.first].Term, nil
 }
@@ -153,11 +149,12 @@ func (l *RaftLog) appendEntries(prevLogIndex uint64, entries []*pb.Entry) {
 	if prevLogIndex < l.LastIndex() {
 		i := 0
 		for ; i < len(entries) && entries[i].Index <= l.LastIndex(); i++ {
-			term, _ := l.Term(entries[i].Index)
-			if entries[i].Term != term {
+			if entries[i].Term != l.entries[uint64(i)+prevLogIndex+1-l.first].Term {
 				// delete the conflict entries
 				l.entries = l.entries[:entries[i].Index-l.first]
-				l.stabled = entries[i].Index - 1
+				if l.stabled > entries[i].Index-1 {
+					l.stabled = entries[i].Index - 1
+				}
 				break
 			}
 		}
