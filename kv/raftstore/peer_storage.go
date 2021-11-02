@@ -308,6 +308,53 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
+	txn := ps.Engines.Raft.NewTransaction(false)
+	defer txn.Discard()
+	startKey := meta.RaftLogKey(ps.region.Id, entries[0].Index)
+	endKey := meta.RaftLogKey(ps.region.Id, entries[len(entries)-1].Index)
+	iter := txn.NewIterator(badger.DefaultIteratorOptions)
+	defer iter.Close()
+	iter.Seek(startKey)
+	i := 0
+	for ; i < len(entries); i++ {
+		if !iter.Valid() {
+			break
+		}
+		if bytes.Compare(iter.Item().Key(), endKey) > 0 {
+			break
+		}
+		val, err := iter.Item().Value()
+		if err != nil {
+			return err
+		}
+		var entry eraftpb.Entry
+		if err = entry.Unmarshal(val); err != nil {
+			return err
+		}
+		if entry.Index != entries[i].Index || entry.Term != entries[i].Term {
+			if i > 1 {
+				ps.raftState.LastIndex = entries[i-1].Index
+				ps.raftState.LastTerm = entries[i-1].Term
+			}
+			stateKey := meta.RaftStateKey(ps.region.Id)
+			for ; iter.Valid() && bytes.Compare(iter.Item().Key(), stateKey) < 0; iter.Next() {
+				raftWB.DeleteMeta(iter.Item().Key())
+			}
+			break
+		}
+		iter.Next()
+	}
+	entries = entries[i:]
+	// append all entries
+	for _, entry := range entries {
+		if err := raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry); err != nil {
+			return err
+		}
+	}
+	if len(entries) > 0 {
+		ps.raftState.LastIndex = entries[len(entries)-1].Index
+		ps.raftState.LastTerm = entries[len(entries)-1].Term
+	}
 	return nil
 }
 
@@ -331,6 +378,23 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
+	raftWB := new(engine_util.WriteBatch)
+	if len(ready.Entries) > 0 {
+		err := ps.Append(ready.Entries, raftWB)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// HardState needs to be updated
+	if ready.Term != 0 || ready.Vote != 0 || ready.Commit != 0 {
+		ps.raftState.HardState = &ready.HardState
+	}
+	if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
+		return nil, err
+	}
+	if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
+		return nil, err
+	}
 	return nil, nil
 }
 
