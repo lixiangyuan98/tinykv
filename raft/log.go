@@ -65,6 +65,7 @@ func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
 	var err error
 	l := new(RaftLog)
+	l.storage = storage
 	firstIndex, err := storage.FirstIndex()
 	if err != nil {
 		log.Panicf("init RaftLog error: %v", err)
@@ -87,6 +88,7 @@ func newLog(storage Storage) *RaftLog {
 		l.entries = append(l.entries, ents...)
 		l.stabled = lastIndex
 	}
+	l.applied = firstIndex - 1
 	log.Debugf("new RaftLog is %+v", l)
 	return l
 }

@@ -163,6 +163,9 @@ func (rn *RawNode) Ready() Ready {
 		rd.HardState.Vote = rn.Raft.Vote
 		rd.HardState.Commit = rn.Raft.RaftLog.committed
 	}
+	if rn.Raft.RaftLog.pendingSnapshot != nil {
+		rd.Snapshot = *rn.Raft.RaftLog.pendingSnapshot
+	}
 	rd.Entries = rn.Raft.RaftLog.unstableEntries()
 	rd.CommittedEntries = rn.Raft.RaftLog.nextEnts()
 	rd.Messages = rn.Raft.msgs
@@ -187,6 +190,9 @@ func (rn *RawNode) HasReady() bool {
 	if len(rn.Raft.msgs) > 0 {
 		return true
 	}
+	if rn.Raft.RaftLog.pendingSnapshot != nil {
+		return true
+	}
 	return false
 }
 
@@ -205,6 +211,10 @@ func (rn *RawNode) Advance(rd Ready) {
 	}
 	if len(rd.CommittedEntries) > 0 {
 		rn.Raft.RaftLog.applied = rd.CommittedEntries[len(rd.CommittedEntries)-1].Index
+	}
+	if rd.Snapshot.Metadata != nil {
+		rn.Raft.RaftLog.pendingSnapshot = nil
+		rn.Raft.RaftLog.applied = rd.Snapshot.Metadata.Index
 	}
 	rn.Raft.msgs = rn.Raft.msgs[len(rd.Messages):]
 }

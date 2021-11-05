@@ -73,60 +73,83 @@ func (d *peerMsgHandler) HandleRaftReady() {
 				log.Warnf("error when unmarshalling: %v", err)
 				continue
 			}
-			kvWB := new(engine_util.WriteBatch)
+
 			resp := newCmdResp()
 			var snapTxn *badger.Txn
-			txn := d.peerStorage.Engines.Kv.NewTransaction(false)
-			iter := txn.NewIterator(badger.DefaultIteratorOptions)
-			for _, req := range msg.Requests {
-				var response raft_cmdpb.Response
-				switch req.CmdType {
-				case raft_cmdpb.CmdType_Get:
-					iter.Seek(engine_util.KeyWithCF(req.Get.Cf, req.Get.Key))
-					v, err := iter.Item().Value()
-					if err != nil {
-						log.Warnf("error when get: %v", err)
-						BindRespError(resp, err)
-						break
+			kvWB := new(engine_util.WriteBatch)
+			// client requests
+			if msg.AdminRequest == nil {
+				txn := d.peerStorage.Engines.Kv.NewTransaction(false)
+				iter := txn.NewIterator(badger.DefaultIteratorOptions)
+				for _, req := range msg.Requests {
+					var response raft_cmdpb.Response
+					switch req.CmdType {
+					case raft_cmdpb.CmdType_Get:
+						iter.Seek(engine_util.KeyWithCF(req.Get.Cf, req.Get.Key))
+						v, err := iter.Item().Value()
+						if err != nil {
+							log.Warnf("error when get: %v", err)
+							BindRespError(resp, err)
+							break
+						}
+						response.Get = new(raft_cmdpb.GetResponse)
+						response.Get.Value = v
+						response.CmdType = raft_cmdpb.CmdType_Get
+					case raft_cmdpb.CmdType_Put:
+						kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
+						response.CmdType = raft_cmdpb.CmdType_Put
+					case raft_cmdpb.CmdType_Delete:
+						kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
+						response.CmdType = raft_cmdpb.CmdType_Delete
+					case raft_cmdpb.CmdType_Snap:
+						// TODO
+						snapTxn = d.peerStorage.Engines.Kv.NewTransaction(false)
+						response.CmdType = raft_cmdpb.CmdType_Snap
+						response.Snap = new(raft_cmdpb.SnapResponse)
+						response.Snap.Region = d.Region()
+					default:
+						log.Warnf("invalid request: %+v", req)
+						response.CmdType = raft_cmdpb.CmdType_Invalid
 					}
-					response.Get = new(raft_cmdpb.GetResponse)
-					response.Get.Value = v
-					response.CmdType = raft_cmdpb.CmdType_Get
-				case raft_cmdpb.CmdType_Put:
-					kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
-					response.CmdType = raft_cmdpb.CmdType_Put
-				case raft_cmdpb.CmdType_Delete:
-					kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
-					response.CmdType = raft_cmdpb.CmdType_Delete
-				case raft_cmdpb.CmdType_Snap:
-					// TODO
-					snapTxn = d.peerStorage.Engines.Kv.NewTransaction(false)
-					response.CmdType = raft_cmdpb.CmdType_Snap
-					response.Snap = new(raft_cmdpb.SnapResponse)
-					response.Snap.Region = d.Region()
-				default:
-					log.Warnf("invalid request: %+v", req)
-					response.CmdType = raft_cmdpb.CmdType_Invalid
+					resp.Responses = append(resp.Responses, &response)
 				}
-				resp.Responses = append(resp.Responses, &response)
+				iter.Close()
+				txn.Discard()
+				d.peerStorage.applyState.AppliedIndex = entry.Index
+			} else { // admin request
+				switch msg.AdminRequest.CmdType {
+				case raft_cmdpb.AdminCmdType_ChangePeer:
+				case raft_cmdpb.AdminCmdType_CompactLog:
+					// if msg.AdminRequest.CompactLog.CompactIndex - d.LastCompactedIdx >
+					d.peerStorage.applyState.TruncatedState.Index = msg.AdminRequest.CompactLog.CompactIndex
+					d.peerStorage.applyState.TruncatedState.Term = msg.AdminRequest.CompactLog.CompactTerm
+					d.ScheduleCompactLog(msg.AdminRequest.CompactLog.CompactIndex)
+				case raft_cmdpb.AdminCmdType_TransferLeader:
+				case raft_cmdpb.AdminCmdType_Split:
+				default:
+					log.Warnf("invalid admin request: %+v", msg.AdminRequest)
+					resp.AdminResponse.CmdType = raft_cmdpb.AdminCmdType_InvalidAdmin
+				}
 			}
-			iter.Close()
-			txn.Discard()
-			d.peerStorage.applyState.AppliedIndex = entry.Index
 			_ = kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 			if err := kvWB.WriteToDB(d.peerStorage.Engines.Kv); err != nil {
 				log.Warnf("err when apply: %v", err)
 			}
+
 			for i, p := range d.proposals {
 				if entry.Index == p.index {
-					if entry.Term != p.term {
-						p.cb.Done(ErrRespStaleCommand(entry.Term))
-					} else {
-						p.cb.Txn = snapTxn
-						p.cb.Done(resp)
+					if p.cb != nil {
+						if entry.Term != p.term {
+							p.cb.Done(ErrRespStaleCommand(entry.Term))
+						} else {
+							p.cb.Txn = snapTxn
+							p.cb.Done(resp)
+						}
 					}
 					for j := 0; j < i; j++ {
-						d.proposals[j].cb.Done(ErrRespStaleCommand(entry.Term))
+						if d.proposals[j].cb != nil {
+							d.proposals[j].cb.Done(ErrRespStaleCommand(entry.Term))
+						}
 					}
 					d.proposals = d.proposals[i+1:]
 					break

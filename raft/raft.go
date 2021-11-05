@@ -187,7 +187,9 @@ func newRaft(c *Config) *Raft {
 	}
 	r.RaftLog = newLog(c.Storage)
 	r.RaftLog.committed = hardState.Commit
-	r.RaftLog.applied = c.Applied
+	if c.Applied != 0 {
+		r.RaftLog.applied = c.Applied
+	}
 	return r
 }
 
@@ -209,6 +211,9 @@ func (r *Raft) sendRequestVote(to uint64) bool {
 // current commit index to the given peer. Returns true if a message was sent.
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
+	if r.Prs[to].Next < r.RaftLog.first {
+		return r.sendSnapshot(to)
+	}
 	var entries []*pb.Entry
 	ents := r.RaftLog.entries[r.Prs[to].Next-r.RaftLog.first:]
 	for _, entry := range ents {
@@ -228,6 +233,26 @@ func (r *Raft) sendAppend(to uint64) bool {
 		Commit:   r.RaftLog.committed,
 		Snapshot: nil,
 		Reject:   false,
+	}
+	r.msgs = append(r.msgs, msg)
+	return true
+}
+
+func (r *Raft) sendSnapshot(to uint64) bool {
+	snapshot, err := r.RaftLog.storage.Snapshot()
+	if err != nil {
+		if err != ErrSnapshotTemporarilyUnavailable {
+			log.Warnf("%v err when getting snapshot: %v", r.id, err)
+		}
+		return false
+	}
+	msg := pb.Message{
+		MsgType:  pb.MessageType_MsgSnapshot,
+		To:       to,
+		From:     r.id,
+		Term:     r.Term,
+		Commit:   r.RaftLog.committed,
+		Snapshot: &snapshot,
 	}
 	r.msgs = append(r.msgs, msg)
 	return true
@@ -346,6 +371,8 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleHeartbeat(m)
 		case pb.MessageType_MsgAppend:
 			r.handleAppendEntries(m)
+		case pb.MessageType_MsgSnapshot:
+			r.handleSnapshot(m)
 		}
 	case StateCandidate:
 		switch m.MsgType {
@@ -385,6 +412,8 @@ func (r *Raft) Step(m pb.Message) error {
 			}
 		case pb.MessageType_MsgAppend:
 			r.handleAppendEntries(m)
+		case pb.MessageType_MsgSnapshot:
+			r.handleSnapshot(m)
 		}
 	case StateLeader:
 		switch m.MsgType {
@@ -458,6 +487,8 @@ func (r *Raft) Step(m pb.Message) error {
 					}
 				}
 			}
+		case pb.MessageType_MsgSnapshot:
+			r.handleSnapshot(m)
 		}
 	}
 	return nil
@@ -591,6 +622,31 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	if m.Term < r.Term {
+		msg := pb.Message{
+			// this message is for leader to update term, the MessageType is unused
+			MsgType: pb.MessageType_MsgSnapshot,
+			To:      m.From,
+			From:    r.id,
+			Term:    r.Term,
+			Reject:  true,
+		}
+		r.msgs = append(r.msgs, msg)
+	} else {
+		r.becomeFollower(m.Term, m.From)
+		r.RaftLog.pendingSnapshot = m.Snapshot
+		if m.Snapshot.Metadata.Index < r.RaftLog.LastIndex() {
+			r.RaftLog.entries = r.RaftLog.entries[m.Snapshot.Metadata.Index+1-r.RaftLog.first:]
+		} else {
+			r.RaftLog.entries = r.RaftLog.entries[:0]
+		}
+		r.RaftLog.first = m.Snapshot.Metadata.Index + 1
+		r.RaftLog.lastTerm = m.Snapshot.Metadata.Term
+		r.RaftLog.stabled = m.Snapshot.Metadata.Index
+		for _, peer := range m.Snapshot.Metadata.ConfState.Nodes {
+			r.Prs[peer] = new(Progress)
+		}
+	}
 }
 
 // addNode add a new node to raft group
