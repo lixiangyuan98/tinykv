@@ -310,6 +310,10 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 	r.Lead = lead
 	r.Vote = 0
 	r.electionElapsed = 0
+	if r.leadTransferee != 0 {
+		r.Lead = r.leadTransferee
+		r.leadTransferee = 0
+	}
 }
 
 // becomeCandidate transform this peer's state to candidate
@@ -373,6 +377,22 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleAppendEntries(m)
 		case pb.MessageType_MsgSnapshot:
 			r.handleSnapshot(m)
+		case pb.MessageType_MsgTransferLeader:
+			_ = r.Step(pb.Message{
+				MsgType: pb.MessageType_MsgTimeoutNow,
+				To:      r.id,
+				From:    r.id,
+			})
+		case pb.MessageType_MsgTimeoutNow:
+			if _, ok := r.Prs[r.id]; !ok {
+				break
+			}
+			r.electionElapsed = 0
+			_ = r.Step(pb.Message{
+				MsgType: pb.MessageType_MsgHup,
+				From:    r.id,
+				To:      r.id,
+			})
 		}
 	case StateCandidate:
 		switch m.MsgType {
@@ -414,6 +434,16 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleAppendEntries(m)
 		case pb.MessageType_MsgSnapshot:
 			r.handleSnapshot(m)
+		case pb.MessageType_MsgTimeoutNow:
+			if _, ok := r.Prs[r.id]; !ok {
+				break
+			}
+			r.electionElapsed = 0
+			_ = r.Step(pb.Message{
+				MsgType: pb.MessageType_MsgHup,
+				From:    r.id,
+				To:      r.id,
+			})
 		}
 	case StateLeader:
 		switch m.MsgType {
@@ -438,7 +468,24 @@ func (r *Raft) Step(m pb.Message) error {
 					r.sendHeartbeat(peer)
 				}
 			}
+		case pb.MessageType_MsgTransferLeader:
+			r.leadTransferee = m.From
+			if progress, ok := r.Prs[m.From]; ok {
+				if progress.Match != r.RaftLog.LastIndex() {
+					r.sendAppend(m.From)
+				} else {
+					r.msgs = append(r.msgs, pb.Message{
+						MsgType: pb.MessageType_MsgTimeoutNow,
+						To:      m.From,
+						From:    m.To,
+					})
+				}
+			}
 		case pb.MessageType_MsgPropose:
+			// stop accepting new proposals when transferring
+			if r.leadTransferee != 0 {
+				break
+			}
 			index := r.RaftLog.LastIndex() + 1
 			for _, entry := range m.Entries {
 				entry.Index = index
@@ -486,9 +533,29 @@ func (r *Raft) Step(m pb.Message) error {
 						break
 					}
 				}
+				// transferee’s log is up-to-date now, start transferring
+				if r.leadTransferee != 0 && r.Prs[m.From].Match == r.RaftLog.LastIndex() {
+					r.msgs = append(r.msgs, pb.Message{
+						MsgType: pb.MessageType_MsgTimeoutNow,
+						To:      m.From,
+						From:    m.To,
+						Term:    r.Term,
+					})
+				}
 			}
 		case pb.MessageType_MsgSnapshot:
 			r.handleSnapshot(m)
+		case pb.MessageType_MsgTimeoutNow:
+			if _, ok := r.Prs[r.id]; !ok {
+				break
+			}
+			r.becomeFollower(r.Term, 0)
+			r.electionElapsed = 0
+			_ = r.Step(pb.Message{
+				MsgType: pb.MessageType_MsgHup,
+				From:    r.id,
+				To:      r.id,
+			})
 		}
 	}
 	return nil
@@ -537,8 +604,6 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			if err == ErrUnavailable {
 				msg.Index = r.RaftLog.LastIndex() + 1
 			} else {
-				// TODO
-				log.Panicf("too small")
 				msg.Index = m.Index - 1
 			}
 			msg.Reject = true
@@ -586,8 +651,6 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 			if err == ErrUnavailable {
 				msg.Index = r.RaftLog.LastIndex() + 1
 			} else {
-				// TODO
-				log.Panicf("too small")
 				msg.Index = m.Index - 1
 			}
 			msg.Reject = true
@@ -652,9 +715,39 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	if _, ok := r.Prs[id]; !ok {
+		r.Prs[id] = new(Progress)
+		r.Prs[id].Next = r.RaftLog.LastIndex() + 1
+	}
 }
 
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+	if _, ok := r.Prs[id]; ok {
+		delete(r.Prs, id)
+		// update commit index
+		if len(r.Prs) > 0 {
+			var matchIndexes uint64Slice
+			for _, progress := range r.Prs {
+				matchIndexes = append(matchIndexes, progress.Match)
+			}
+			sort.Sort(matchIndexes)
+			// a majority of matchIndexes[i] ≥ matchIndex
+			matchIndex := matchIndexes[(len(matchIndexes)-1)/2]
+			for i := matchIndex; i > r.RaftLog.committed; i-- {
+				term, _ := r.RaftLog.Term(i)
+				if term == r.Term {
+					r.RaftLog.committed = i
+					// tell the followers to commit
+					_ = r.Step(pb.Message{
+						MsgType: pb.MessageType_MsgPropose,
+						From:    r.id,
+						To:      r.id,
+					})
+					break
+				}
+			}
+		}
+	}
 }
