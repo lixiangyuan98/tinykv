@@ -374,18 +374,21 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	if err := ps.clearMeta(kvWB, raftWB); err != nil {
 		return nil, err
 	}
-	// ps.clearExtraData()
+	ps.clearExtraData(snapData.Region)
 	ps.raftState.LastIndex = snapshot.Metadata.Index
 	ps.raftState.LastTerm = snapshot.Metadata.Term
 
 	// apply snapshot
+	notifier := make(chan bool, 1)
 	ps.regionSched <- &runner.RegionTaskApply{
 		RegionId: ps.region.Id,
-		Notifier: make(chan bool),
+		Notifier: notifier,
 		SnapMeta: snapshot.Metadata,
-		StartKey: ps.region.StartKey,
-		EndKey:   ps.region.EndKey,
+		StartKey: snapData.Region.StartKey,
+		EndKey:   snapData.Region.EndKey,
 	}
+	ps.snapState.StateType = snap.SnapState_Applying
+	<-notifier
 	ps.applyState.TruncatedState.Index = snapshot.Metadata.Index
 	ps.applyState.TruncatedState.Term = snapshot.Metadata.Term
 	ps.applyState.AppliedIndex = snapshot.Metadata.Index
@@ -419,6 +422,9 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	}
 	_ = raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
 	_ = kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState)
+	regionState := new(rspb.RegionLocalState)
+	regionState.Region = ps.region
+	_ = kvWB.SetMeta(meta.RegionStateKey(ps.region.Id), regionState)
 	if err = raftWB.WriteToDB(ps.Engines.Raft); err != nil {
 		return result, err
 	}

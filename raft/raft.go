@@ -255,6 +255,8 @@ func (r *Raft) sendSnapshot(to uint64) bool {
 		Snapshot: &snapshot,
 	}
 	r.msgs = append(r.msgs, msg)
+	r.Prs[to].Next = snapshot.Metadata.Index + 1
+	r.Prs[to].Match = snapshot.Metadata.Index
 	return true
 }
 
@@ -604,17 +606,11 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			if err == ErrUnavailable {
 				msg.Index = r.RaftLog.LastIndex() + 1
 			} else {
-				msg.Index = m.Index - 1
+				msg.Index = 0
 			}
 			msg.Reject = true
 		} else if term != m.LogTerm {
-			i := m.Index
-			for ; i > r.RaftLog.first; i-- {
-				if r.RaftLog.entries[i-r.RaftLog.first].Term != term {
-					break
-				}
-			}
-			msg.Index = i
+			msg.Index = m.Index
 			msg.Reject = true
 		} else {
 			r.RaftLog.appendEntries(m.Index, m.Entries)
@@ -651,17 +647,11 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 			if err == ErrUnavailable {
 				msg.Index = r.RaftLog.LastIndex() + 1
 			} else {
-				msg.Index = m.Index - 1
+				msg.Index = 0
 			}
 			msg.Reject = true
 		} else if term != m.LogTerm {
-			i := m.Index
-			for ; i > r.RaftLog.first; i-- {
-				if r.RaftLog.entries[i-r.RaftLog.first].Term != term {
-					break
-				}
-			}
-			msg.Index = i
+			msg.Index = m.Index
 			msg.Reject = true
 		} else {
 			lastNewEntryIndex := m.Index
@@ -688,7 +678,7 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 	if m.Term < r.Term {
 		msg := pb.Message{
 			// this message is for leader to update term, the MessageType is unused
-			MsgType: pb.MessageType_MsgSnapshot,
+			MsgType: pb.MessageType_MsgAppendResponse,
 			To:      m.From,
 			From:    r.id,
 			Term:    r.Term,
@@ -697,15 +687,21 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 		r.msgs = append(r.msgs, msg)
 	} else {
 		r.becomeFollower(m.Term, m.From)
-		r.RaftLog.pendingSnapshot = m.Snapshot
 		if m.Snapshot.Metadata.Index < r.RaftLog.LastIndex() {
-			r.RaftLog.entries = r.RaftLog.entries[m.Snapshot.Metadata.Index+1-r.RaftLog.first:]
-		} else {
-			r.RaftLog.entries = r.RaftLog.entries[:0]
+			// ignore old snapshot
+			return
 		}
+		if r.RaftLog.pendingSnapshot != nil && m.Snapshot.Metadata.Index < r.RaftLog.pendingSnapshot.Metadata.Index {
+			// a newer snapshot is applying
+			return
+		}
+		r.RaftLog.pendingSnapshot = m.Snapshot
+		r.RaftLog.entries = r.RaftLog.entries[:0]
 		r.RaftLog.first = m.Snapshot.Metadata.Index + 1
 		r.RaftLog.lastTerm = m.Snapshot.Metadata.Term
 		r.RaftLog.stabled = m.Snapshot.Metadata.Index
+		r.RaftLog.committed = m.Snapshot.Metadata.Index
+		r.RaftLog.applied = m.Snapshot.Metadata.Index
 		for _, peer := range m.Snapshot.Metadata.ConfState.Nodes {
 			r.Prs[peer] = new(Progress)
 		}
