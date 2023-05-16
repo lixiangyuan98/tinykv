@@ -223,17 +223,16 @@ func (r *Raft) sendAppend(to uint64) bool {
 	prevLogIndex := r.Prs[to].Next - 1
 	prevLogTerm, _ := r.RaftLog.Term(prevLogIndex)
 	msg := pb.Message{
-		MsgType:  pb.MessageType_MsgAppend,
-		To:       to,
-		From:     r.id,
-		Term:     r.Term,
-		LogTerm:  prevLogTerm,
-		Index:    prevLogIndex,
-		Entries:  entries,
-		Commit:   r.RaftLog.committed,
-		Snapshot: nil,
-		Reject:   false,
+		MsgType: pb.MessageType_MsgAppend,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+		LogTerm: prevLogTerm,
+		Index:   prevLogIndex,
+		Entries: entries,
+		Commit:  r.RaftLog.committed,
 	}
+	// log.Infof("%v sendAppend %+v %+v", r.id, msg, r.Prs[to])
 	r.msgs = append(r.msgs, msg)
 	return true
 }
@@ -257,6 +256,7 @@ func (r *Raft) sendSnapshot(to uint64) bool {
 	r.msgs = append(r.msgs, msg)
 	r.Prs[to].Next = snapshot.Metadata.Index + 1
 	r.Prs[to].Match = snapshot.Metadata.Index
+	// log.Infof("%v sendSnapshot %+v %+v", r.id, msg, r.Prs[to])
 	return true
 }
 
@@ -471,6 +471,9 @@ func (r *Raft) Step(m pb.Message) error {
 				}
 			}
 		case pb.MessageType_MsgTransferLeader:
+			if m.From == r.id {
+				break
+			}
 			r.leadTransferee = m.From
 			if progress, ok := r.Prs[m.From]; ok {
 				if progress.Match != r.RaftLog.LastIndex() {
@@ -484,12 +487,16 @@ func (r *Raft) Step(m pb.Message) error {
 				}
 			}
 		case pb.MessageType_MsgPropose:
+			// log.Infof("%v propose %+v", r.id, m)
 			// stop accepting new proposals when transferring
 			if r.leadTransferee != 0 {
 				break
 			}
 			index := r.RaftLog.LastIndex() + 1
 			for _, entry := range m.Entries {
+				if entry.EntryType == pb.EntryType_EntryConfChange {
+					r.PendingConfIndex = index
+				}
 				entry.Index = index
 				entry.Term = r.Term
 				index++
@@ -613,8 +620,31 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 			msg.Index = m.Index
 			msg.Reject = true
 		} else {
-			r.RaftLog.appendEntries(m.Index, m.Entries)
 			lastNewEntryIndex := m.Index + uint64(len(m.Entries))
+			if len(m.Entries) > 0 {
+				// compare
+				if m.Index < r.RaftLog.LastIndex() {
+					i := 0
+					for ; i < len(m.Entries) && m.Entries[i].Index <= r.RaftLog.LastIndex(); i++ {
+						if m.Entries[i].Term != r.RaftLog.entries[uint64(i)+m.Index+1-r.RaftLog.first].Term {
+							// delete the conflict entries
+							r.RaftLog.entries = r.RaftLog.entries[:m.Entries[i].Index-r.RaftLog.first]
+							if r.RaftLog.stabled > m.Entries[i].Index-1 {
+								r.RaftLog.stabled = m.Entries[i].Index - 1
+							}
+							break
+						}
+					}
+					m.Entries = m.Entries[i:]
+				}
+				for _, entry := range m.Entries {
+					if entry.EntryType == pb.EntryType_EntryConfChange {
+						r.PendingConfIndex = entry.Index
+					}
+					r.RaftLog.entries = append(r.RaftLog.entries, *entry)
+				}
+			}
+			// r.RaftLog.appendEntries(m.Index, m.Entries)
 			msg.Index = lastNewEntryIndex
 			if m.Commit > r.RaftLog.committed && lastNewEntryIndex > r.RaftLog.committed {
 				if m.Commit > lastNewEntryIndex {
@@ -702,6 +732,7 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 		r.RaftLog.stabled = m.Snapshot.Metadata.Index
 		r.RaftLog.committed = m.Snapshot.Metadata.Index
 		r.RaftLog.applied = m.Snapshot.Metadata.Index
+		log.Infof("%v conf state %+v", r.id, m.Snapshot.Metadata.ConfState)
 		for _, peer := range m.Snapshot.Metadata.ConfState.Nodes {
 			r.Prs[peer] = new(Progress)
 		}
@@ -711,10 +742,20 @@ func (r *Raft) handleSnapshot(m pb.Message) {
 // addNode add a new node to raft group
 func (r *Raft) addNode(id uint64) {
 	// Your Code Here (3A).
+	if id == r.id {
+		return
+	}
 	if _, ok := r.Prs[id]; !ok {
 		r.Prs[id] = new(Progress)
 		r.Prs[id].Next = r.RaftLog.LastIndex() + 1
 	}
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgHeartbeat,
+		To:      id,
+		From:    r.id,
+		Term:    r.Term,
+	})
+	log.Infof("%v after add Node %v %+v", r.id, id, r.Prs)
 }
 
 // removeNode remove a node from raft group
@@ -745,5 +786,6 @@ func (r *Raft) removeNode(id uint64) {
 				}
 			}
 		}
+		log.Infof("%v after remove node %v %+v", r.id, id, r.Prs)
 	}
 }

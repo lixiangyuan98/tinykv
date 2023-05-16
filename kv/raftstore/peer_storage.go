@@ -62,6 +62,7 @@ func NewPeerStorage(engines *engine_util.Engines, region *metapb.Region, regionS
 		return nil, err
 	}
 	if raftState.LastIndex < applyState.AppliedIndex {
+		log.Infof("%+v peers %+v raftState %+v %+v applyState %+v %+v", region, region.Peers, raftState, raftState.HardState, applyState, applyState.TruncatedState)
 		panic(fmt.Sprintf("%s unexpected raft log index: lastIndex %d < appliedIndex %d",
 			tag, raftState.LastIndex, applyState.AppliedIndex))
 	}
@@ -374,7 +375,10 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	if err := ps.clearMeta(kvWB, raftWB); err != nil {
 		return nil, err
 	}
-	ps.clearExtraData(snapData.Region)
+	if !util.RegionEqual(ps.region, snapData.Region) {
+		ps.clearExtraData(snapData.Region)
+		ps.region = snapData.Region
+	}
 	ps.raftState.LastIndex = snapshot.Metadata.Index
 	ps.raftState.LastTerm = snapshot.Metadata.Term
 
@@ -422,9 +426,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 	}
 	_ = raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
 	_ = kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState)
-	regionState := new(rspb.RegionLocalState)
-	regionState.Region = ps.region
-	_ = kvWB.SetMeta(meta.RegionStateKey(ps.region.Id), regionState)
+	meta.WriteRegionState(kvWB, ps.region, rspb.PeerState_Normal)
 	if err = raftWB.WriteToDB(ps.Engines.Raft); err != nil {
 		return result, err
 	}

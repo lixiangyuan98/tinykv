@@ -217,6 +217,7 @@ func (rn *RawNode) Advance(rd Ready) {
 		rn.Raft.RaftLog.applied = rd.Snapshot.Metadata.Index
 	}
 	rn.Raft.msgs = rn.Raft.msgs[len(rd.Messages):]
+	rn.Raft.PendingConfIndex = 0
 	rn.Raft.RaftLog.maybeCompact()
 }
 
